@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import contextlib
+import importlib
 import sys
 import socket
 import math
@@ -15,12 +16,13 @@ import threading
 import random
 
 from contextlib import redirect_stdout, redirect_stderr
+from pathlib import Path
 
 
 #from tkinter.font import Font
 from PyQt6.QtWidgets import *
 #from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer, QUrl, QEvent
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer, QUrl, QEvent,QPropertyAnimation, QEasingCurve,QPoint
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer, QUrl, QEvent,QPropertyAnimation, QEasingCurve,QPoint, QFileSystemWatcher
 from PyQt6.QtCore import QMetaObject
 from PyQt6.QtGui import QFont,QTextCursor, QPalette, QColor, QAction, QKeySequence, QIntValidator, QLinearGradient, QPainter, QPen
 from PyQt6.QtCore import QSize
@@ -32,7 +34,7 @@ from PyQt6.QtNetwork import QNetworkProxy
 from PyQt6.QtCore import QMetaObject, Qt
 from PyQt6.QtWidgets import QFileDialog, QInputDialog,QGraphicsDropShadowEffect
 from widgets.ai_assistant import AIAssistantWidget
-
+from PyQt6.QtWidgets import QSplitter
 #from core.reporting import REPORT_DIR
 # Import LazyFramework
 from bin.console import LazyFramework
@@ -54,10 +56,16 @@ from widgets.notif import CyberpunkToast
 from widgets.theme_manager import ThemeManager
 from widgets.network_map import NetworkMapWidget
 from widgets.proxy_dialog import ProxySettingsDialog
-
+from widgets.module_watcher import ModuleWatcher   # ← TAMBAHKAN INI
+from widgets.module_tab import ModuleTab
 # Import dari folder core/
 from core.capture import UniversalCapture
 from core.module_runner import ModuleRunner
+
+
+# Get absolute project root directory
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 
 class GUIConsole:
@@ -134,7 +142,8 @@ class LazyFrameworkGUI(QMainWindow):
         self.session_output_signal.connect(self.append_session_output)
         self.console_output_signal.connect(self.append_output)
         #self.start_global_capture()
-
+        self.active_listeners = []  # ← TAMBAHKAN INI
+        self.listener_lock = threading.RLock()  # ← TAMBAHKAN INI
         import glob
         import shutil
         cache_dirs = glob.glob("**/__pycache__", recursive=True)
@@ -145,6 +154,10 @@ class LazyFrameworkGUI(QMainWindow):
                 pass
                 
         #self.load_banner()
+        self.module_watcher = ModuleWatcher(self.framework, gui_instance=self, parent=self)
+        self.module_watcher.modulesRefreshed.connect(self.load_all_modules)
+        QTimer.singleShot(800, self.module_watcher.start_watching)  # Delay sedikit
+        #QTimer.singleShot(500, self.start_module_watcher)  # Auto-scan watcher
         QTimer.singleShot(2000, self.start_tor_auto_rotate)
         self.last_tor_ip = None
         self.active_module = ""
@@ -161,7 +174,24 @@ class LazyFrameworkGUI(QMainWindow):
             duration_ms=5000,
             level="success"
         ))
-    
+
+
+    def on_module_selected(self, item):
+        """Single click: Tampilkan info di Module Info tab"""
+        if not item:
+            return
+        
+        module_path = item.data(0, Qt.ItemDataRole.UserRole)
+        if not module_path:
+            return
+        
+        # Load module info ke tab Module Info
+        self.load_module_info_to_main_tab(module_path)
+        
+        # Update label
+        module_name = module_path.split('/')[-1]
+        self.current_module_label.setText(f"Selected: {module_name}")
+
     def show_cyber_toast(self, message: str, title: str = "", 
                      duration_ms: int = 5500, level: str = "info",
                      width: int = 420, icon: str = None):
@@ -177,34 +207,82 @@ class LazyFrameworkGUI(QMainWindow):
         toast.show()
 
     def stop_module(self):
-        if not hasattr(self, "module_runner") or self.module_runner is None:
-            return
+            if not hasattr(self, "module_runner") or self.module_runner is None:
+                return
 
-        if not self.module_runner.isRunning():
-            return
+            if not self.module_runner.isRunning():
+                return
 
-        self.append_output("[yellow]Stopping module…[/yellow]")
+            self.append_output("[yellow]Stopping module…[/]")
 
-        try:
-            self.module_runner.stop()
-        except Exception as e:
-            self.append_output(f"[red]Stop error: {e}[/red]")
+            try:
+                self.module_runner.stop()
+            except Exception as e:
+                self.append_output(f"[red]Stop error: {e}[/]")
 
-        self.run_btn.setEnabled(True)
-        self.run_btn.setText("START")
-        self.run_btn.setProperty("action", "run")
+            # Cleanup khusus untuk reverse_tcp
+            if self.framework.loaded_module and "reverse_tcp" in str(self.framework.loaded_module).lower():
+                self.cleanup_reverse_tcp_sessions()
 
-       
+            # Reset tombol
+            self.run_btn.setEnabled(True)
+            self.run_btn.setText("START")
+            self.run_btn.setProperty("action", "run")
 
-        self.append_output("[green]✓ Stop requested[/green]")
-
-        # JANGAN self.module_runner = None DI SINI
-        # Tunggu finished.emit() baru reset
-        if self.framework.loaded_module and "reverse_tcp" in str(self.framework.loaded_module):
-           self.cleanup_reverse_tcp_sessions()
+            self.append_output("[green]✓ Module stopped successfully[/]")
 
 
+    def cleanup_reverse_tcp_sessions(self):
+            """Cleanup reverse_tcp listener dan sessions dengan aman"""
+            self.append_output("[yellow][*] Cleaning up reverse TCP sessions...[/]")
+            
+            try:
+                # Stop listener jika ada
+                if hasattr(self, 'reverse_listener') and self.reverse_listener is not None:
+                    self.reverse_listener.running = False
+                    if hasattr(self.reverse_listener, 'server_socket') and self.reverse_listener.server_socket:
+                        try:
+                            self.reverse_listener.server_socket.close()
+                        except:
+                            pass
+                    self.reverse_listener = None
+                with self.listener_lock:
+                    self.active_listeners.clear()
+                    self.append_output("[green]✓ Active listeners cleared[/]")
+        
+                # Tutup semua socket di GUI sessions
+                with self.session_lock:
+                    for sess in list(self.sessions.values()):
+                        if sess.get('socket'):
+                            try:
+                                sess['socket'].close()
+                            except:
+                                pass
+                    self.sessions.clear()
 
+                # Clear sessions di module reverse_tcp
+                try:
+                    if (self.framework.loaded_module and 
+                        hasattr(self.framework.loaded_module, 'module') and
+                        hasattr(self.framework.loaded_module.module, 'SESSIONS')):
+                        mod = self.framework.loaded_module.module
+                        with getattr(mod, 'SESSIONS_LOCK', _rtcp_mod.SESSIONS_LOCK):
+                            mod.SESSIONS.clear()
+                    else:
+                        with _rtcp_mod.SESSIONS_LOCK:
+                            _rtcp_mod.SESSIONS.clear()
+                except:
+                    pass
+
+                self.update_sessions_ui()
+                self.update_session_info()
+                if hasattr(self, 'network_map_widget'):
+                    self.network_map_widget.refresh_map()
+                    
+                self.append_output("[green]✓ Reverse TCP cleanup completed[/]")
+
+            except Exception as e:
+                self.append_output(f"[red]Cleanup error: {e}[/]")
 
 
     def handle_run_stop(self):
@@ -221,11 +299,161 @@ class LazyFrameworkGUI(QMainWindow):
           
 
 
-    
+    def open_module_in_tab(self, module_path: str):
+        """Open module in new tab (di area module_tabs)"""
+        from widgets.module_tab import ModuleTab
+        
+        print(f"[DEBUG] Opening module in tab: {module_path}")
+        
+        # Cek apakah module ada
+        if module_path not in self.framework.modules:
+            self.append_output(f"[red]Module tidak ditemukan: {module_path}[/]")
+            return
+        
+        # Cek apakah sudah ada tab yang sama di module_tabs
+        for i in range(self.module_tabs.count()):
+            widget = self.module_tabs.widget(i)
+            if isinstance(widget, ModuleTab) and widget.module_name == module_path:
+                self.module_tabs.setCurrentIndex(i)
+                self.append_output(f"[dim]Module already open in tab[/]")
+                return
+        
+        try:
+            import importlib.util
+            
+            # Dapatkan path file module
+            module_file = self.framework.modules[module_path]
+            
+            # Load module secara manual
+            spec = importlib.util.spec_from_file_location(
+                module_path.replace('/', '_'), 
+                module_file
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            
+            # Buat ModuleInstance
+            from bin.console import ModuleInstance
+            mod_instance = ModuleInstance(module_path, mod)
+            
+            # Set default options
+            if hasattr(mod, "OPTIONS"):
+                for k, meta in mod.OPTIONS.items():
+                    if "default" in meta:
+                        mod_instance.options[k] = meta["default"]
+            
+            # Create tab
+            tab = ModuleTab(
+                framework=self.framework,
+                module_name=module_path,
+                module_instance=mod_instance,
+                parent=self.module_tabs  # ← parent ke module_tabs
+            )
+            
+            # Populate options
+            self._populate_module_tab_options(tab, mod_instance)
+            
+            # Tab label
+            short_name = module_path.split("/")[-1]
+            idx = self.module_tabs.addTab(tab, f"⚡ {short_name}")
+            self.module_tabs.setCurrentIndex(idx)
+            
+            # Enable closable tabs (already set in create_main_content)
+            
+            self.append_output(f"[green]✓ Opened module tab: {short_name}[/]")
+            
+        except Exception as e:
+            self.append_output(f"[red]Error opening tab: {e}[/]")
+            import traceback
+            self.append_output(f"[red]{traceback.format_exc()}[/]")
 
-    
-    
+
+
+    def _populate_module_tab_options(self, tab: "ModuleTab", mod_instance):
+        """Populate options di dalam Module Tab (bukan global)"""
+        from PyQt6.QtWidgets import QLineEdit, QLabel
+        
+        try:
+            options = getattr(mod_instance, 'options', {})
+            if not options:
+                options = getattr(mod_instance.module, 'OPTIONS', {})
+            
+            for key, meta in options.items():
+                label = QLabel(key)
+                field = QLineEdit()
+                
+                # Get current/default value
+                current_val = ''
+                if isinstance(meta, dict):
+                    current_val = meta.get('value', '') or meta.get('default', '')
+                elif isinstance(meta, str):
+                    current_val = meta
+                
+                field.setText(str(current_val))
+                
+                if isinstance(meta, dict) and meta.get('description'):
+                    field.setPlaceholderText(meta['description'])
+                    label.setToolTip(meta['description'])
+                
+                # Save ke options module instance
+                def make_updater(k):
+                    def updater(val):
+                        if k in mod_instance.options:
+                            mod_instance.options[k] = val
+                        elif hasattr(mod_instance.module, 'OPTIONS'):
+                            if k in mod_instance.module.OPTIONS:
+                                if isinstance(mod_instance.module.OPTIONS[k], dict):
+                                    mod_instance.module.OPTIONS[k]['value'] = val
+                    return updater
+                
+                field.textChanged.connect(make_updater(key))
+                tab.options_layout.addRow(label, field)
+                tab.option_widgets[key] = field
+                
+        except Exception as e:
+            print(f"[ERROR] _populate_module_tab_options: {e}")
+
+
+    def _close_module_tab(self, index: int):
+        """Close module tab from module_tabs widget"""
+        try:
+            widget = self.module_tabs.widget(index)
+            if isinstance(widget, ModuleTab):
+                # Stop module runner jika sedang berjalan
+                if hasattr(widget, 'module_runner') and widget.module_runner and widget.module_runner.isRunning():
+                    widget.module_runner.stop()
+                    widget.module_runner.wait(800)
+                
+                # Request close dari dalam tab juga
+                if hasattr(widget, '_request_close'):
+                    widget._request_close()
+                else:
+                    self.module_tabs.removeTab(index)
+                    widget.deleteLater()
+            else:
+                # Fallback jika bukan ModuleTab
+                self.module_tabs.removeTab(index)
+                if widget:
+                    widget.deleteLater()
+                    
+            self.append_output(f"[dim]✓ Tab closed[/]")
+            
+        except Exception as e:
+            self.append_output(f"[red]Error closing tab: {e}[/]")
+            import traceback
+            self.append_output(f"[red]{traceback.format_exc()}[/]")
+            # Force close
+            try:
+                self.module_tabs.removeTab(index)
+            except:
+                pass
+
+
+
     def ensure_monospace_fonts(self):
+        # Tambahkan ini di awal method:
+        if not hasattr(self, 'console_output'):
+            return
         """Ensure all text widgets use consistent monospace fonts TANPA OVERRIDE THEME"""
         try:
             # Daftar font monospace yang diurutkan berdasarkan preferensi
@@ -266,12 +494,16 @@ class LazyFrameworkGUI(QMainWindow):
             # Module Info (sidebar) - HANYA FONT
             self.module_info.setFont(QFont(available_font, 9))
             
-            # Module List - HANYA FONT
-            module_list_font = QFont(available_font, 10)
-            for i in range(self.module_list.count()):
-                item = self.module_list.item(i)
-                if item:
-                    item.setFont(module_list_font)
+            # Module Tree - set font ke semua node
+            if hasattr(self, 'module_tree'):
+                tree_font = QFont(available_font, 10)
+                def _set_tree_font(node):
+                    node.setFont(0, tree_font)
+                    for j in range(node.childCount()):
+                        _set_tree_font(node.child(j))
+                root_node = self.module_tree.invisibleRootItem()
+                for i in range(root_node.childCount()):
+                    _set_tree_font(root_node.child(i))
             
             # Option Widgets - HANYA FONT
             if hasattr(self, 'option_widgets'):
@@ -545,7 +777,7 @@ class LazyFrameworkGUI(QMainWindow):
         font_family = "DejaVu Sans Mono, Source Code Pro, Consolas, Monaco, Courier New, monospace"
         self.console_output.setStyleSheet(f"font-family: {font_family};")
         #self.load_banner()
-        self.update_info_panel()
+        #self.update_info_panel()
     #def start_global_capture(self):
         #"""Start global output capture"""
         #self.capture.start_capture()
@@ -573,7 +805,8 @@ class LazyFrameworkGUI(QMainWindow):
         p = self.current_proxy
 
         self.append_output(f"[cyan]Switched to proxy → {p['server']}:{p['port']} ({p['type']})[/]")
-        
+        # Tambahkan ini:
+        self.update_session_info()
         self.append_output(f"[cyan]Browser proxy updated via PAC → {p['server']}:{p['port']}[/]")
     
     def create_menu_bar(self):
@@ -639,117 +872,170 @@ class LazyFrameworkGUI(QMainWindow):
 
         
     def create_main_content(self):
-        """Create main content area"""
+        """Create main content area dengan tombol di HEADER (atas tab)"""
         main_widget = QWidget()
         layout = QVBoxLayout(main_widget)
-        theme_switcher = self.theme_manager.create_theme_switcher()
-        layout.addWidget(theme_switcher)
-        pty_toolbar = QToolBar("PTY Tools")
-        pty_toolbar.setIconSize(QSize(24, 24))
-        pty_toolbar.setStyleSheet("""
-            QToolBar {
-                background: #1e1e1e;
-                border: 1px solid #333;
-                border-radius: 5px;
-                padding: 3px;
-                margin: 2px;
-            }
-            QToolButton {
-                background: #2d2d2d;
-                color: #50fa7b;
-                border: 1px solid #50fa7b;
-                border-radius: 4px;
-                padding: 5px 10px;
-                margin: 2px;
-                font-weight: bold;
-            }
-            QToolButton:hover {
-                background: #50fa7b;
-                color: #1e1e1e;
+        layout.setSpacing(0)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # === HEADER BAR (Tombol START, BACK, Clear) ===
+        header_widget = QWidget()
+        header_widget.setFixedHeight(48)
+        header_widget.setStyleSheet("""
+            QWidget {
+                background: #252526;
+                border-bottom: 1px solid #3c3c3c;
             }
         """)
-        
-        # Tombol-tombol PTY
-        nano_btn = QAction("📝 Nano", self)
-        nano_btn.triggered.connect(self.open_file_with_nano)
-        pty_toolbar.addAction(nano_btn)
-        
-        vim_btn = QAction("✍️ Vim", self)
-        vim_btn.triggered.connect(lambda: self.pty_run_app('vim'))
-        pty_toolbar.addAction(vim_btn)
-        
-        htop_btn = QAction("📊 Htop", self)
-        htop_btn.triggered.connect(self.run_htop)
-        pty_toolbar.addAction(htop_btn)
-        
-        tmux_btn = QAction("🖥️ Tmux", self)
-        tmux_btn.triggered.connect(self.run_tmux)
-        pty_toolbar.addAction(tmux_btn)
-        
-        mc_btn = QAction("📁 MC", self)
-        mc_btn.triggered.connect(self.run_mc)
-        pty_toolbar.addAction(mc_btn)
-        
-        pty_toolbar.addSeparator()
-        
-        # PTY Spawn manual (full bash)
-        pty_spawn_btn = QAction("🐚 Spawn PTY", self)
-        pty_spawn_btn.triggered.connect(self.pty_spawn_bash)   # ← ini kita tambahkan
-        pty_toolbar.addAction(pty_spawn_btn)
-        
-        layout.addWidget(pty_toolbar)
-        # Tab widget for different views
-        self.tabs = QTabWidget()
+        header_layout = QHBoxLayout(header_widget)
+        header_layout.setContentsMargins(12, 8, 12, 8)
+        header_layout.setSpacing(10)
 
-        # Console tab
+        # Tombol START
+        self.run_btn = QPushButton("▶ START")
+        self.run_btn.setProperty("action", "run")
+        self.run_btn.clicked.connect(self.handle_run_stop)
+        self.run_btn.setEnabled(False)
+        self.run_btn.setMinimumWidth(110)
+        self.run_btn.setStyleSheet("""
+            QPushButton {
+                background: #007acc;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background: #1a8cdb; }
+            QPushButton:pressed { background: #005a9e; }
+            QPushButton[action="stop"] { background: #c72e2e; }
+            QPushButton[action="stop"]:hover { background: #e03333; }
+        """)
+        header_layout.addWidget(self.run_btn)
+
+        # Tombol BACK
+        self.back_btn = QPushButton("BACK")
+        self.back_btn.clicked.connect(self.unload_module)
+        self.back_btn.setEnabled(False)
+        self.back_btn.setMinimumWidth(90)
+        self.back_btn.setStyleSheet("""
+            QPushButton {
+                background: #2d2d2d;
+                color: #cccccc;
+                border: 1px solid #3c3c3c;
+                border-radius: 4px;
+                padding: 6px 16px;
+            }
+            QPushButton:hover { background: #3a3a3a; }
+        """)
+        header_layout.addWidget(self.back_btn)
+
+        # Tombol Clear Console
+        clear_btn = QPushButton("Clear Console")
+        clear_btn.clicked.connect(self.clear_console)
+        clear_btn.setMinimumWidth(120)
+        clear_btn.setStyleSheet("""
+            QPushButton {
+                background: #2d2d2d;
+                color: #cccccc;
+                border: 1px solid #3c3c3c;
+                border-radius: 4px;
+                padding: 6px 16px;
+            }
+            QPushButton:hover { background: #3a3a3a; }
+        """)
+        header_layout.addWidget(clear_btn)
+
+        header_layout.addStretch()
+        layout.addWidget(header_widget)
+        
+        # === SPLITTER (Tabs) ===
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setHandleWidth(6)
+
+        # VSCode Tab Style
+        vscode_tab_style = """
+            QTabWidget::pane {
+                border: none;
+                background: #1e1e1e;
+            }
+            QTabBar {
+                background: #252526;
+                border-bottom: 1px solid #3c3c3c;
+            }
+            QTabBar::tab {
+                background: #252526;
+                color: #858585;
+                padding: 8px 16px;     /* dikecilkan sedikit */
+                margin: 0 1px 0 0;
+                border: none;
+                min-width: 60px;      /* paksa ukuran minimum sama */
+                max-width: 160px;      /* batasi maksimum */
+                font-size: 10pt;
+                height: 16px;          /* tinggi tab sama semua */
+            }
+            QTabBar::tab:first {
+                margin-left: 4px;
+            }
+            QTabBar::tab:selected {
+                color: #ffffff;
+                background: #1e1e1e;
+                border-bottom: 2px solid #007acc;
+            }
+            QTabBar::tab:hover:!selected {
+                color: #cccccc;
+                background: #2d2d2d;
+            }
+        """
+
+        # Main Tabs
+        self.main_tabs = QTabWidget()
+        self.main_tabs.setDocumentMode(True)
+        self.main_tabs.setStyleSheet(vscode_tab_style)
+
         self.console_output = QTextEdit()
         self.console_output.setReadOnly(True)
-        self.console_output.setFont(QFont("DejaVu Sans Mono Bold", 10))
+        self.console_output.setFont(QFont("DejaVu Sans Mono", 10))
         self.console_output.setAcceptRichText(True)
-        self.tabs.addTab(self.console_output, "Console")
+        self.main_tabs.addTab(self.console_output, "Console")
 
-        # Options tab
         self.options_widget = QWidget()
         self.options_layout = QFormLayout(self.options_widget)
         self.options_scroll = QScrollArea()
         self.options_scroll.setWidgetResizable(True)
         self.options_scroll.setWidget(self.options_widget)
-        self.tabs.addTab(self.options_scroll, "Options")
+        self.main_tabs.addTab(self.options_scroll, "Options")
 
-
-        
-        # Module info tab
         self.module_detail_info = QTextEdit()
         self.module_detail_info.setReadOnly(True)
-        self.module_detail_info.setFont(QFont("Hack", 11))
-        self.tabs.addTab(self.module_detail_info, "Module Info")
-        self.module_detail_info.setObjectName("module_detail_info")
+        self.module_detail_info.setFont(QFont("Hack", 10))
+        self.main_tabs.addTab(self.module_detail_info, "Module Info")
+
         self.network_map_widget = NetworkMapWidget(self)
-        self.tabs.addTab(self.network_map_widget, "Network Map")
-        # TAMBAH TAB SESSION MANAGEMENT
+        self.main_tabs.addTab(self.network_map_widget, "Network Map")
+
+        # Sessions Tab (ringkas)
         self.session_tab = QWidget()
         self.session_layout = QVBoxLayout(self.session_tab)
+        self.session_layout.setContentsMargins(8, 8, 8, 8)
+        self.session_layout.setSpacing(6)
 
         # Header
-        header = QLabel("Session Management")
-        header.setObjectName("session_header")  # Tambahkan object name untuk styling
-        #header.setStyleSheet("""
-            #QLabel#session_header {
-                #font-weight: bold; 
-                #font-size: 16px; 
-                #margin: 10px; 
-                #font-family: Hack;
-                #padding: 8px;
-                #border-bottom: 2px solid #0078d4;
-            #}
-        #""")
-        self.session_layout.addWidget(header)
+        session_header = QLabel("Session Management")
+        session_header.setStyleSheet("font-size: 13pt; font-weight: bold; color: #ffffff; padding: 4px;")
+        self.session_layout.addWidget(session_header)
 
-        # Session List (QListWidget)
+        # Session List
         self.session_list = QListWidget()
         self.session_list.itemClicked.connect(self.on_session_selected)
-        self.session_layout.addWidget(self.session_list)
-
+        self.session_list.setStyleSheet("""
+            QListWidget {
+                background: #1e1e1e;
+                border: 1px solid #3c3c3c;
+                border-radius: 4px;
+            }
+        """)
+        self.session_layout.addWidget(self.session_list, 2)
 
         # Command Input
         cmd_layout = QHBoxLayout()
@@ -760,17 +1046,15 @@ class LazyFrameworkGUI(QMainWindow):
 
         send_btn = QPushButton("Send")
         send_btn.clicked.connect(self.send_session_command)
+        send_btn.setFixedWidth(80)
         cmd_layout.addWidget(send_btn)
-
         self.session_layout.addLayout(cmd_layout)
 
-        # Output Console untuk Session
+        # Session Output
         self.session_output = QTextEdit()
         self.session_output.setReadOnly(True)
-        #self.session_output.setStyleSheet("background: #000; color: #0f0; font-family: 'Courier New';")
-        self.session_layout.addWidget(self.session_output)
-
-        
+        self.session_output.setFont(QFont("DejaVu Sans Mono", 9))
+        self.session_layout.addWidget(self.session_output, 3)
 
         # Action Buttons
         btn_layout = QHBoxLayout()
@@ -779,177 +1063,36 @@ class LazyFrameworkGUI(QMainWindow):
         btn_layout.addWidget(upgrade_btn)
 
         kill_btn = QPushButton("Kill Session")
-        kill_btn.clicked.connect(self.kill_session)
-        kill_btn.setStyleSheet("background: #8B0000; color: white;")
+        kill_btn.setStyleSheet("background: #c72e2e; color: white;")
+        kill_btn.clicked.connect(self.kill_selected_session)
         btn_layout.addWidget(kill_btn)
 
         self.session_layout.addLayout(btn_layout)
 
-        # Tambah Tab
-        self.tabs.addTab(self.session_tab, "Sessions")
-        
-                # === AI ASSISTANT TAB ===
+        self.main_tabs.addTab(self.session_tab, "Sessions")
+
         self.ai_tab = AIAssistantWidget(framework=self.framework)
-        self.tabs.addTab(self.ai_tab, "🤖 AI Assistant")
+        self.main_tabs.addTab(self.ai_tab, "🤖 AI Assistant")
 
-        layout.addWidget(self.tabs)
+        splitter.addWidget(self.main_tabs)
 
-        # Control buttons
-        control_layout = QHBoxLayout()
+        # Module Tabs (Bottom)
+        self.module_tabs = QTabWidget()
+        self.module_tabs.setTabsClosable(True)
+        self.module_tabs.setDocumentMode(True)
+        self.module_tabs.setStyleSheet(vscode_tab_style)
+        self.module_tabs.tabCloseRequested.connect(self._close_module_tab)
+        bottom_widget = QWidget()
+        bottom_layout = QVBoxLayout(bottom_widget)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.addWidget(self.module_tabs)
+        splitter.addWidget(bottom_widget)
 
-        #self.run_btn = QPushButton("START")
-        #self.run_btn.setProperty("action", "run")
-        #self.run_btn.clicked.connect(self.handle_run_stop)
-        #self.run_btn.clicked.connect(self.run_module)
-        #self.run_btn.setEnabled(False)
-        #control_layout.addWidget(self.run_btn)
-
-        self.run_btn = QPushButton("START")
-        self.run_btn.setProperty("action", "run")
-        self.run_btn.clicked.connect(self.handle_run_stop)
-        self.run_btn.setEnabled(False)
-        control_layout.addWidget(self.run_btn)
-
-
-
-        
-        self.back_btn = QPushButton("BACK")
-        self.back_btn.clicked.connect(self.unload_module)
-        self.back_btn.setEnabled(False)
-        control_layout.addWidget(self.back_btn)
-
-        clear_btn = QPushButton("Clear Console")
-        clear_btn.clicked.connect(self.clear_console)
-        control_layout.addWidget(clear_btn)
-
-        layout.addLayout(control_layout)
+        splitter.setSizes([680, 340])
+        layout.addWidget(splitter)
 
         return main_widget
-
-    def pty_spawn_bash(self):
-        """Spawn full interactive bash shell"""
-        self.pty_run_app('bash')
-
-    def pty_run_app(self, app_name, filename=None):
-        """Run interactive PTY application (nano, vim, htop, tmux, mc, bash, etc.)
-        Versi lengkap dengan multiple fallback"""
-        
-        if not self.selected_session_id:
-            self.append_output("[red]❌ Pilih session terlebih dahulu![/]")
-            return
-
-        session_id = self.selected_session_id
-        
-        # Bangun command
-        if filename:
-            target_cmd = f"{app_name} {filename}"
-        else:
-            target_cmd = app_name
-
-        self.append_output(f"[yellow][*] Spawning {app_name} in PTY...[/yellow]")
-        self.append_output(f"[dim]Command: {target_cmd}[/]")
-
-        try:
-            from modules.payloads.reverse.reverse_tcp import get_session, send_command_to_session
-
-            session = get_session(session_id)
-            success = False
-
-            # METODE 1: Gunakan method dari session class (paling baik)
-            if session and hasattr(session, 'spawn_pty_and_run'):
-                try:
-                    result = session.spawn_pty_and_run(target_cmd)
-                    if result:
-                        self.append_output(f"[green]{result}[/]")
-                        success = True
-                except Exception as e:
-                    self.append_output(f"[yellow]spawn_pty_and_run error: {e}[/]")
-
-            # METODE 2: Fallback PTY python -c
-            if not success:
-                self.append_output("[yellow][*] Menggunakan fallback PTY spawn...[/yellow]")
-                
-                pty_cmd = f'''python3 -c '
-    import pty, os, subprocess, time
-    os.environ["TERM"] = "xterm-256color"
-    os.environ["LANG"] = "en_US.UTF-8"
-    try:
-        pty.spawn(["/bin/bash", "-c", "{target_cmd}"])
-    except:
-        try:
-            pty.spawn(["/bin/sh", "-c", "{target_cmd}"])
-        except:
-            try:
-                master, slave = os.openpty()
-                proc = subprocess.Popen(["/bin/bash", "-c", "{target_cmd}"], 
-                                    stdin=slave, stdout=slave, stderr=slave, 
-                                    preexec_fn=os.setsid)
-                os.close(slave)
-                time.sleep(1)
-            except:
-                os.system("{target_cmd}")
-    ' 2>/dev/null &'''
-
-                success = send_command_to_session(session_id, pty_cmd)
-
-            # METODE 3: Emergency fallback
-            if not success:
-                self.append_output("[yellow][*] Emergency fallback...[/yellow]")
-                emergency = f"nohup {target_cmd} > /tmp/{app_name}.log 2>&1 &"
-                send_command_to_session(session_id, emergency)
-
-            if success:
-                self.append_output(f"[bold green]✓ {app_name} berhasil dijalankan di PTY![/]")
-                self.append_output("[cyan]→ Pindah ke tab **Sessions** untuk berinteraksi[/]")
-                
-                # Auto switch ke tab Sessions
-                try:
-                    idx = self.tabs.indexOf(self.session_tab)
-                    if idx >= 0:
-                        self.tabs.setCurrentIndex(idx)
-                    self.session_cmd_input.setFocus()
-                except:
-                    pass
-            else:
-                self.append_output("[red]❌ Gagal spawn PTY[/red]")
-
-        except Exception as e:
-            self.append_output(f"[red]PTY Error: {e}[/]")
-            # Ultimate fallback
-            try:
-                from modules.payloads.reverse.reverse_tcp import send_command_to_session
-                fallback = f"python3 -c 'import pty; pty.spawn([\"/bin/bash\", \"-c\", \"{target_cmd}\"])' 2>/dev/null &"
-                send_command_to_session(session_id, fallback)
-            except:
-                pass
-
-    def open_file_with_nano(self):
-        """Open file dialog dan edit dengan nano"""
-        if not self.selected_session_id:
-            self.append_output("[red]❌ Pilih session dulu[/red]")
-            return
-        
-        file_path, ok = QInputDialog.getText(
-            self, "Edit File with Nano", 
-            "Enter file path to edit:", 
-            QLineEdit.EchoMode.Normal,
-            "api-green.txt"
-        )
-        
-        if ok and file_path:
-            self.pty_run_app('nano', file_path)
-
-    def run_htop(self):
-        """Run htop di session"""
-        self.pty_run_app('htop')
-
-    def run_tmux(self):
-        """Run tmux di session"""
-        self.pty_run_app('tmux')
-
-    def run_mc(self):
-        """Run midnight commander di session"""
-        self.pty_run_app('mc')
+    
     
     def interact_with_session(self, session_id):
         """Handle session interaction from network map click"""
@@ -972,7 +1115,7 @@ class LazyFrameworkGUI(QMainWindow):
             self.update_sessions_ui()
             
             # Switch ke Sessions tab
-            self.tabs.setCurrentIndex(4)  # Sessions tab index
+            self.main_tabs.setCurrentIndex(4)
             
             # Tampilkan pesan
             session = self.sessions[actual_id]
@@ -989,7 +1132,7 @@ class LazyFrameworkGUI(QMainWindow):
                 self.selected_session_id = session_id
                 self.active_session_id = session_id
                 self.update_sessions_ui()
-                self.tabs.setCurrentIndex(4)
+                self.main_tabs.setCurrentIndex(4) #
                 self.append_output(f"[green]✓ Interacting with Session {session_id}[/]")
                 self.session_cmd_input.setFocus()
             else:
@@ -1107,11 +1250,13 @@ class LazyFrameworkGUI(QMainWindow):
         sidebar = QWidget()
         sidebar.setMaximumWidth(400)
         layout = QVBoxLayout(sidebar)
+        layout.setSpacing(4)
+        layout.setContentsMargins(4, 4, 4, 4)
 
         # Search box
         search_layout = QHBoxLayout()
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search modules...")
+        self.search_input.setPlaceholderText("🔍  Search modules...")
         self.search_input.textChanged.connect(self.search_modules)
         search_layout.addWidget(self.search_input)
 
@@ -1121,34 +1266,100 @@ class LazyFrameworkGUI(QMainWindow):
         search_layout.addWidget(search_btn)
         layout.addLayout(search_layout)
 
-        # Category buttons
+        # Category buttons dengan warna per kategori
         categories_layout = QHBoxLayout()
+        categories_layout.setSpacing(3)
         categories = [
-            ("All", "all"), ("Recon", "recon"), ("Strike", "strike"),
-            ("Hold", "hold"), ("Ops", "ops"), ("Payloads", "payloads")
+            ("All",      "all",      "#8be9fd"),
+            ("Recon",    "recon",    "#50fa7b"),
+            ("Strike",   "strike",   "#ff5555"),
+            ("Hold",     "hold",     "#f1fa8c"),
+            ("Ops",      "ops",      "#ffb86c"),
+            ("Payloads", "payloads", "#bd93f9"),
         ]
 
-        for name, cat_type in categories:
+        for name, cat_type, color in categories:
             btn = QPushButton(name)
             btn.setProperty('category', cat_type)
+            btn.setFixedHeight(24)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #252525;
+                    color: #fff;
+                    border: 1px solid grey;
+                    border-radius: 3px;
+                    font-size: 10px;
+                    font-weight: bold;
+                    padding: 0 4px;
+                }}
+                QPushButton:hover {{
+                    background: transparent;
+                    color: red;
+                }}
+                QPushButton:pressed {{
+                    background: {color};
+                    color: #000000;
+                }}
+            """)
             btn.clicked.connect(self.on_category_click)
             categories_layout.addWidget(btn)
 
         layout.addLayout(categories_layout)
 
-        # Module list
-        self.module_list = QListWidget()
-        self.module_list.itemDoubleClicked.connect(self.load_selected_module)
-        layout.addWidget(self.module_list)
+        # === SPLITTER ===
+        splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # Info Group dengan Browser Controls
-        info_group = QGroupBox()
-        info_layout = QVBoxLayout(info_group)
+        # === QTreeWidget sebagai module explorer (mengganti QListWidget) ===
+        self.module_tree = QTreeWidget()
+        self.module_tree.setHeaderHidden(True)
+        self.module_tree.setColumnCount(1)
+        self.module_tree.setIndentation(16)
+        self.module_tree.setAnimated(True)
+        self.module_tree.setRootIsDecorated(True)
+        self.module_tree.setUniformRowHeights(False)
+        self.module_tree.setStyleSheet("""
+            QTreeWidget {
+                background-color: #1a1a1a;
+                color: #d4d4d4;
+                border: 1px solid #333;
+                font-family: "DejaVu Sans Mono", "Courier New", monospace;
+                font-size: 10px;
+                outline: none;
+                selection-background-color: transparent;
+            }
+            QTreeWidget::item {
+                padding: 2px 4px;
+                border-radius: 2px;
+            }
+            QTreeWidget::item:hover {
+                background: #2a2a3a;
+            }
+            QTreeWidget::item:selected {
+                background: #2d4a6a;
+                color: #ffffff;
+            }
+            QTreeWidget::branch {
+                background: #1a1a1a;
+            }
+        """)
+        self.module_tree.itemDoubleClicked.connect(self.load_selected_module)
+        self.module_tree.itemClicked.connect(self.on_module_selected)
+        # Setelah self.module_tree dibuat (setelah self.module_tree.setStyleSheet)
+        self.module_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.module_tree.customContextMenuRequested.connect(self.show_module_context_menu)
+
+        # Double click = buka di tab baru yang independen
+        self.module_tree.itemDoubleClicked.connect(self._on_module_tree_double_click)
+
+        splitter.addWidget(self.module_tree)
+
+        # Alias agar kode lain yang masih pakai self.module_list tidak crash
+        self.module_list = self.module_tree
 
         # Tab widget untuk info dan browser
         self.info_browser_tabs = QTabWidget()
 
-        # Tab 1: Module Info
+        # Tab 1: Module Info (Guides)
         module_info_tab = QWidget()
         module_info_layout = QVBoxLayout(module_info_tab)
         module_info_layout.setContentsMargins(0, 0, 0, 0)
@@ -1273,12 +1484,10 @@ class LazyFrameworkGUI(QMainWindow):
         </html>
         """)
 
-
         module_info_layout.addWidget(self.module_info)
-
         self.info_browser_tabs.addTab(module_info_tab, "Guides")
 
-        # Tab 2: Browser - MODIFIED STRUCTURE
+        # Tab 2: Browser
         browser_tab = QWidget()
         browser_tab_layout = QVBoxLayout(browser_tab)
         browser_tab_layout.setContentsMargins(0, 0, 0, 0)
@@ -1337,14 +1546,135 @@ class LazyFrameworkGUI(QMainWindow):
 
         self.info_browser_tabs.addTab(browser_tab, "Browser")
 
-        # Tambahkan tab widget ke layout utama info group
-        info_layout.addWidget(self.info_browser_tabs)
-        layout.addWidget(info_group)
+        # Tambahkan tab widget ke splitter
+        splitter.addWidget(self.info_browser_tabs)
+        
+        # Set initial sizes (500 untuk module list, 350 untuk guides/browser)
+        splitter.setSizes([500, 450])
+        
+        # Tambahkan splitter ke layout utama
+        layout.addWidget(splitter)
 
         return sidebar
     
     
-    
+    def _on_module_tree_double_click(self, item, column):
+        """Double click = open in new tab (default)"""
+        module_path = item.data(0, Qt.ItemDataRole.UserRole)
+        if module_path and module_path in self.framework.modules:
+            self.open_module_in_tab(module_path)  # Buka di tab baru
+
+    def show_module_context_menu(self, position):
+        """Show context menu when right-clicking on module"""
+        item = self.module_tree.itemAt(position)
+        if not item:
+            return
+        
+        module_path = item.data(0, Qt.ItemDataRole.UserRole)
+        if not module_path:
+            return
+        
+        module_name = module_path.split('/')[-1]
+        
+        # Buat menu
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background: #2d2d2d;
+                color: #ffffff;
+                border: 1px solid #555;
+                padding: 5px;
+            }
+            QMenu::item {
+                padding: 6px 25px;
+                margin: 2px;
+            }
+            QMenu::item:selected {
+                background: #3a3a5a;
+            }
+        """)
+        
+        # Action: Open in Main Tab (single click / replace current)
+        main_tab_action = QAction("📌 Open in Single Tab", self)
+        main_tab_action.triggered.connect(lambda: self.load_module_to_main_tab(module_path))
+        menu.addAction(main_tab_action)
+        
+        # Action: Open in New Tab
+        new_tab_action = QAction("➕ Open in New Tab", self)
+        new_tab_action.triggered.connect(lambda: self.open_module_in_tab(module_path))
+        menu.addAction(new_tab_action)
+        
+        menu.addSeparator()
+        
+        # Action: Module Info (show info without loading)
+        info_action = QAction("ℹ️ Show Module Info", self)
+        info_action.triggered.connect(lambda: self.show_module_info_only(module_path))
+        menu.addAction(info_action)
+        
+        # Tampilkan menu di posisi kursor
+        menu.exec(self.module_tree.viewport().mapToGlobal(position))
+
+
+    def load_module_to_main_tab(self, module_path: str):
+        """Load module ke area utama (main_tabs) - seperti single click"""
+        try:
+            args = [module_path]
+            self.framework.cmd_use(args)
+            
+            if self.framework.loaded_module:
+                self.current_module = self.framework.loaded_module.name
+                self.current_module_label.setText(f"Loaded: {self.current_module}")
+                self.current_module_label.setStyleSheet("color: #50fa7b; font-weight: bold;")
+                self.run_btn.setEnabled(True)
+                self.back_btn.setEnabled(True)
+                self.load_module_options()
+                self.show_module_info_in_tab()
+                
+                self.append_output(f"[green]✓ Loaded module: {module_path.split('/')[-1]} in main tab[/]")
+                
+                # Switch ke console tab di main_tabs
+                self.main_tabs.setCurrentIndex(0)  # Console tab
+                
+        except Exception as e:
+            self.append_output(f"[red]Error loading module: {e}[/]")
+
+
+    def show_module_info_only(self, module_path: str):
+        """Show module info without loading it"""
+        module_meta = self.framework.metadata.get(module_path, {})
+        module_name = module_path.split('/')[-1]
+        
+        html = f"""
+        <html>
+        <head>
+        <style>
+            body {{ 
+                background: #1e1e1e; 
+                color: #d4d4d4; 
+                font-family: monospace;
+                padding: 15px;
+            }}
+            .name {{ color: #50fa7b; font-size: 16px; font-weight: bold; }}
+            .desc {{ margin-top: 10px; padding: 10px; background: #252525; border-radius: 5px; }}
+            .rank {{ color: #f1fa8c; }}
+        </style>
+        </head>
+        <body>
+            <div class="name">📦 {module_name}</div>
+            <div><b>Path:</b> {module_path}</div>
+            <div><b>Rank:</b> <span class="rank">{module_meta.get('rank', 'Normal')}</span></div>
+            <div class="desc">{module_meta.get('description', 'No description')}</div>
+        </body>
+        </html>
+        """
+        
+        # Tampilkan di module info tab
+        self.module_detail_info.setHtml(html)
+        self.main_tabs.setCurrentIndex(2)  # Module Info tab index
+
+
+
+
     def open_browser_panel(self):
         """Show the browser panel (jika sudah ada) atau buat baru - FIXED VERSION"""
         if hasattr(self, 'browser') and self.browser:
@@ -1863,6 +2193,12 @@ class LazyFrameworkGUI(QMainWindow):
     def update_proxy_status(self):
         """Update proxy status display"""
         self.update_session_info()
+
+    def safe_ui_update(self, func):
+        if QThread.currentThread() == QApplication.instance().thread():
+            func()
+        else:
+            QTimer.singleShot(0, func)  # ← replaces broken invokeMethod call
    
     def append_output(self, text):
         """Append output ke console GUI dengan:
@@ -1874,6 +2210,10 @@ class LazyFrameworkGUI(QMainWindow):
         - Matrix color coding
         """
         if not text or not text.strip():
+            return
+
+        if QThread.currentThread() != QApplication.instance().thread():
+            self.console_output_signal.emit(str(text))
             return
 
         # Safety check - ensure console_output exists
@@ -1930,8 +2270,8 @@ class LazyFrameworkGUI(QMainWindow):
                 self.session_output.moveCursor(QTextCursor.MoveOperation.End)
 
         # === 5. AUTO-SWITCH ke Sessions jika session baru ===
-        if detected and self.tabs.currentIndex() != 3:
-            self.tabs.setCurrentIndex(3)
+        if detected and self.main_tabs.currentIndex() != 3:
+            self.main_tabs.setCurrentIndex(3)
             # Gunakan Matrix-style message untuk session detection
             self.append_output("[matrix-cyan]🔄 MATRIX SESSION DETECTED! Switching to control panel...[/]")
 
@@ -2281,7 +2621,49 @@ class LazyFrameworkGUI(QMainWindow):
 
             # Coba deteksi OS dari raw_text
             detected_os = 'unknown'
+            detected_hostname = 'unknown'
             text_lower = raw_text.lower()
+            # IMPROVED hostname extraction patterns
+            hostname_patterns = [
+                # Standard hostname patterns
+                r'hostname[=:]\s*([a-zA-Z0-9_\-\.]+)',
+                r'computer[_\s]*name[=:]\s*([a-zA-Z0-9_\-\.]+)',
+                r'\[([a-zA-Z0-9_\-\.]+)@',
+                r'([a-zA-Z0-9_\-\.]+)@[\w\.\-]+',
+                # From bash prompt: user@hostname:~$
+                r'@([a-zA-Z0-9_\-\.]+)[:~\s]',
+                # From Windows prompt: C:\Users\username> or hostname>
+                r'([a-zA-Z0-9_\-\.]+)[>\\]',
+                # From output of hostname command
+                r'hostname\s+(\S+)',
+                r'Hostname\s*:\s*(\S+)',
+                # Generic capture of computer name patterns
+                r'(\w[\w\-\.]+)(?:\.local|\.lan|\.internal)',
+            ]
+            for pattern in hostname_patterns:
+                match_host = re.search(pattern, raw_text, re.IGNORECASE)
+                if match_host:
+                    potential_hostname = match_host.group(1)
+                    # Validate hostname (not too long, no weird chars)
+                    if len(potential_hostname) < 50 and len(potential_hostname) > 1:
+                        if not potential_hostname.startswith(('session', 'reverse', 'shell', 'connection')):
+                            detected_hostname = potential_hostname
+                            break
+            # Also try to extract from common output formats
+            lines = raw_text.split('\n')
+            for line in lines[:10]:  # Check first 10 lines
+                line = line.strip()
+                # Look for typical hostname patterns in output
+                if 'hostname' in line.lower():
+                    parts = line.split()
+                    for part in parts:
+                        if '.' in part and len(part) < 50 and len(part) > 3:
+                            if not part.startswith(('http', 'www', '192.', '10.', '172.', '127.')):
+                                detected_hostname = part
+                                break
+                        elif re.match(r'^[a-zA-Z][a-zA-Z0-9\-]{2,20}$', part):
+                            detected_hostname = part
+                            break
             
             if any(keyword in text_lower for keyword in ['linux', 'unix', 'ubuntu', 'debian', 'centos']):
                 detected_os = 'linux'
@@ -2301,8 +2683,8 @@ class LazyFrameworkGUI(QMainWindow):
                 'ip': src_ip,
                 'port': src_port,
                 'os': detected_os,  # ← SIMPAN INFO OS
-                'output': f"[*] Session {sess_id} created\nType: reverse_tcp\nOS: {detected_os}\nSource: {src_ip}:{src_port}\nDestination: {dst_ip}:{dst_port}\n{raw_text}\n\n",
-                'handler': None,
+                'hostname': detected_hostname if detected_hostname != 'unknown' else f"target_{sess_id[-4:]}",
+                'output': f"[*] Session {sess_id} created\nType: reverse_tcp\nOS: {detected_os}\nHostname: {detected_hostname}\nSource: {src_ip}:{src_port}\nDestination: {dst_ip}:{dst_port}\n{raw_text}\n\n",
                 'status': 'alive',
                 'created': time.strftime("%H:%M:%S"),
                 'socket': None
@@ -2318,9 +2700,12 @@ class LazyFrameworkGUI(QMainWindow):
             
             # Update UI
             self.update_sessions_ui()
+            self.update_session_info()           # ← Penting
+            QTimer.singleShot(800, lambda: self.safe_ui_update(self.sync_sessions_from_reverse_tcp))
+            QTimer.singleShot(1200, lambda: self.safe_ui_update(self.update_session_info))
             
             # Auto-switch ke sessions tab
-            self.tabs.setCurrentIndex(3)
+            self.tabs.setCurrentIndex(4)
             
             # Output konfirmasi dengan ikon OS
             os_icons = {'linux': '🐧', 'windows': '🪟', 'macos': '🍎', 'unknown': '💻'}
@@ -2348,12 +2733,18 @@ class LazyFrameworkGUI(QMainWindow):
                 'unknown': '💻'     # Computer untuk unknown
             }
             
+            
             # Add all sessions dengan ikon OS
             for sess_id, sess in self.sessions.items():
                 os_type = sess.get('os', 'unknown')
+                hostname = sess.get('hostname', '')
                 icon = os_icons.get(os_type, '💻')
                 
-                item_text = f"{icon} {sess_id} | {sess.get('ip', '?.?.?.?')}:{sess.get('port', '?')} | {sess.get('type', 'unknown')}"
+                            # Display format with hostname if available
+                if hostname and hostname != 'unknown':
+                    item_text = f"{icon} {hostname[:20]} | {sess.get('ip', '?.?.?.?')}:{sess.get('port', '?')} | {sess.get('type', 'unknown')}"
+                else:
+                    item_text = f"{icon} {sess_id[:12]} | {sess.get('ip', '?.?.?.?')}:{sess.get('port', '?')} | {sess.get('type', 'unknown')}"
                 item = QListWidgetItem(item_text)
                 item.setData(Qt.ItemDataRole.UserRole, sess_id)
                 
@@ -2374,13 +2765,8 @@ class LazyFrameworkGUI(QMainWindow):
                     'macos': '#ffb86c',    # Orange untuk macOS
                     'unknown': '#6272a4'   # Biru untuk unknown
                 }
-                
                 base_color = color_map.get(sess.get('type', ''), "#ffffff")
-                os_color = os_color_map.get(os_type, '#6272a4')
-                
-                # Combine colors atau pilih salah satu
-                item.setForeground(QColor(os_color))  # Gunakan warna OS sebagai primary
-                
+                item.setForeground(QColor(os_color_map.get(os_type, '#6272a4')))
                 self.session_list.addItem(item)
                 
             # Auto-select first session if none selected
@@ -2415,10 +2801,10 @@ class LazyFrameworkGUI(QMainWindow):
                 SESSIONS = _rtcp_mod.SESSIONS
                 SESSIONS_LOCK = _rtcp_mod.SESSIONS_LOCK
             
-            self.append_output("[yellow]Syncing sessions from reverse_tcp...[/]")
+            #self.append_output("[yellow]Syncing sessions from reverse_tcp...[/]")
             
             with SESSIONS_LOCK:
-                self.append_output(f"[dim]ReverseTCP has {len(SESSIONS)} sessions[/]")
+                #self.append_output(f"[dim]ReverseTCP has {len(SESSIONS)} sessions[/]")
                 
                 for sess_id, rev_sess in SESSIONS.items():
                     # Get socket from reverse_tcp session object
@@ -2438,30 +2824,37 @@ class LazyFrameworkGUI(QMainWindow):
                             'lhost': getattr(rev_sess, 'lhost', 'unknown'),
                             'lport': getattr(rev_sess, 'lport', 'unknown'),
                             'os': getattr(rev_sess, 'os', 'unknown'),
-                            'output': f"[*] Session {sess_id} synced from reverse_tcp\n",
-                            'status': getattr(rev_sess, 'status', 'alive'),
+                            'hostname': getattr(rev_sess, 'hostname', 'unknown'),  # TAMBAHKAN INI
+                            'output': f"[*] Session {sess_id} synced from reverse_tcp\n",                            'status': getattr(rev_sess, 'status', 'alive'),
                             'created': getattr(rev_sess, 'created', time.strftime("%H:%M:%S")),
                             'socket': sock,
                             'handler': rev_sess
                         }
-                        self.append_output(f"[green]✓ Added session {sess_id}[/]")
+                        self.append_output(f"[green]✓ Added session {sess_id} (hostname: {getattr(rev_sess, 'hostname', 'unknown')})[/]")
                     else:
                         # Update existing session
                         self.sessions[sess_id]['socket'] = sock
                         self.sessions[sess_id]['handler'] = rev_sess
                         self.sessions[sess_id]['status'] = getattr(rev_sess, 'status', 'alive')
                         self.sessions[sess_id]['os'] = getattr(rev_sess, 'os', 'unknown')
-                        self.append_output(f"[dim]Updated session {sess_id}[/]")
+                        self.sessions[sess_id]['hostname'] = getattr(rev_sess, 'hostname', 'unknown')  # TAMBAHKAN INI
+
+                        #self.append_output(f"[dim]Updated session {sess_id}[/]")
             
             self.update_sessions_ui()
+            self.update_session_info()
+            if hasattr(self, 'network_map_widget'):
+                 self.network_map_widget.refresh_map()
+                 #self.append_output("[green]✓ Network map refreshed[/]")
+    
             
             if len(SESSIONS) > 0:
                 # Auto-select first session
                 first_sess = list(SESSIONS.keys())[0]
                 self.selected_session_id = first_sess
                 self.active_session_id = first_sess
-                self.append_output(f"[green]✓ Auto-selected session: {first_sess}[/]")
-                self.tabs.setCurrentIndex(4)  # Switch to Sessions tab
+                #self.append_output(f"[green]✓ Auto-selected session: {first_sess}[/]")
+                self.main_tabs.setCurrentIndex(4)  # Switch to Sessions tab
                 
                 # Test socket
                 if first_sess in self.sessions and self.sessions[first_sess].get('socket'):
@@ -2471,7 +2864,7 @@ class LazyFrameworkGUI(QMainWindow):
             else:
                 self.append_output("[yellow]No sessions found in reverse_tcp[/]")
             
-            self.append_output(f"[green]✓ Sync complete: {len(self.sessions)} total sessions[/]")
+            #self.append_output(f"[green]✓ Sync complete: {len(self.sessions)} total sessions[/]")
             
         except Exception as e:
             self.append_output(f"[red]Sync error: {e}[/]")
@@ -2479,6 +2872,9 @@ class LazyFrameworkGUI(QMainWindow):
             self.append_output(f"[red]{traceback.format_exc()}[/]")
 
     def append_session_output(self, session_id, text):
+        if QThread.currentThread() != QApplication.instance().thread():
+            self.session_output_signal.emit(session_id, str(text))
+            return
         """Append output to specific session - CLEAN VERSION"""
         try:
             if session_id in self.sessions:
@@ -2628,17 +3024,20 @@ class LazyFrameworkGUI(QMainWindow):
                 
                 # Dapatkan info OS untuk placeholder
                 os_type = session.get('os', 'unknown')
+                hostname = session.get('hostname', '')
+
                 os_display = {
                     'linux': 'Linux',
                     'windows': 'Windows', 
                     'macos': 'macOS',
                     'unknown': 'Unknown OS'
                 }.get(os_type, 'Unknown OS')
-                
-                # Update command input placeholder dengan info OS
-                self.session_cmd_input.setPlaceholderText(
-                    f"Enter command for {os_display} Session {session_id} ({session['type']})..."
-                )
+                if hostname and hostname != 'unknown':
+                    placeholder_text = f"Enter command for {hostname} ({os_display}) Session {session_id}..."
+                else:
+                    placeholder_text = f"Enter command for {os_display} Session {session_id} ({session['type']})..."
+               
+                self.session_cmd_input.setPlaceholderText(placeholder_text)
                 
                 # Highlight selected item
                 for i in range(self.session_list.count()):
@@ -2662,8 +3061,11 @@ class LazyFrameworkGUI(QMainWindow):
                 # Tampilkan info OS di console juga
                 os_icons = {'linux': '🐧', 'windows': '🪟', 'macos': '🍎', 'unknown': '💻'}
                 icon = os_icons.get(os_type, '💻')
-                self.append_output(f"[green]✓ Selected {icon} {os_display} Session {session_id}[/]")
-                
+                if hostname and hostname != 'unknown':
+                    self.append_output(f"[green]✓ Selected {icon} {hostname} ({os_display}) Session {session_id}[/]")
+                else:
+                    self.append_output(f"[green]✓ Selected {icon} {os_display} Session {session_id}[/]")  
+
         except Exception as e:
             self.append_output(f"Session selection error: {e}")
 
@@ -2721,7 +3123,8 @@ class LazyFrameworkGUI(QMainWindow):
                                 if ready_read[0]:
                                     data = sock.recv(8192).decode('utf-8', errors='ignore')
                                     if data:
-                                        self.append_session_output(session_id, data)
+                                        self.session_output_signal.emit(session_id, data)
+
                                 else:
                                     self.append_output("[dim]No immediate response (command may be running)[/]")
                             except Exception as e:
@@ -3275,68 +3678,213 @@ class LazyFrameworkGUI(QMainWindow):
             #self.append_output(f"Banner error: {e}")
 
 
+    # ── Metadata kategori untuk QTreeWidget ──────────────────────────────────────
+    _CAT_META = {
+        "recon":    {"color": "#8be9fd", "icon": "📡", "label": "Recon"},
+        "strike":   {"color": "#8be9fd", "icon": "⚡", "label": "Strike"},
+        "hold":     {"color": "#8be9fd", "icon": "🔒", "label": "Hold"},
+        "ops":      {"color": "#8be9fd", "icon": "🛠️",  "label": "Ops"},
+        "payloads": {"color": "#8be9fd", "icon": "💣", "label": "Payloads"},
+        "other":    {"color": "#8be9fd", "icon": "📦", "label": "Other"},
+    }
+
+    def _detect_category(self, module_path: str) -> str:
+        """Deteksi kategori dari path modul."""
+        p = module_path.lower()
+        if "/recon/"   in p: return "recon"
+        if "/strike/"  in p: return "strike"
+        if "/hold/"    in p: return "hold"
+        if "/ops/"     in p: return "ops"
+        if "payload"   in p: return "payloads"
+        return "other"
+
+    def _make_folder_icon(self, color_hex: str) -> "QIcon":
+        """Buat QIcon folder berwarna."""
+        from PyQt6.QtGui import QPixmap, QPainter, QColor, QLinearGradient, QPen
+        from PyQt6.QtCore import Qt, QPointF
+        size = 20
+        px = QPixmap(size, size)
+        px.fill(Qt.GlobalColor.transparent)
+    
+        painter = QPainter(px)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        # Warna utama folder
+        base_color = QColor(color_hex)
+        light_color = base_color.lighter(140)
+        dark_color = base_color.darker(120)
+        gradient = QLinearGradient(QPointF(0, 6), QPointF(0, 18))
+        gradient.setColorAt(0, light_color)
+        gradient.setColorAt(1, dark_color)
+    
+        painter.setBrush(gradient)
+        painter.setPen(QPen(QColor("#2c3e50"), 1.2))  # Border gelap
+        # Draw folder body (sedikit lebih lebar & rounded)
+        painter.drawRoundedRect(2, 7, 16, 12, 2, 2)
+
+        # === TAB FOLDER (yang di atas) ===
+        tab_gradient = QLinearGradient(QPointF(0, 3), QPointF(0, 7))
+        tab_gradient.setColorAt(0, light_color.lighter(160))
+        tab_gradient.setColorAt(1, base_color)
+    
+        painter.setBrush(tab_gradient)
+        painter.setPen(QPen(QColor("#2c3e50"), 1))
+        painter.drawRoundedRect(2, 4, 9, 5, 2, 2)   # Tab lebih pendek & tebal
+
+        # Highlight di dalam tab (biar kelihatan 3D)
+        painter.setPen(QPen(QColor(255, 255, 255, 80), 1))
+        painter.drawLine(4, 5, 9, 5)
+
+        painter.end()
+        return QIcon(px)
+
+
+
+    def _make_module_icon(self, color_hex: str) -> "QIcon":
+        """Buat QIcon bullet kecil untuk leaf node."""
+        from PyQt6.QtGui import QPixmap, QPainter, QColor
+        px = QPixmap(12, 12)
+        px.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(px)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QColor(color_hex + "aa"))
+        painter.setPen(QColor(color_hex))
+        painter.drawEllipse(1, 1, 10, 10)
+        painter.end()
+        return QIcon(px)
+
     def load_all_modules(self):
-        """Load all modules into the list"""
-        self.module_list.clear()
+        """Load semua modul sebagai QTreeWidget berlapis folder per kategori."""
+        from collections import defaultdict
+        self.module_tree.clear()
         modules = self.framework.metadata
 
+        # Kelompokkan: kategori → sub-path → list modul
+        tree_data = defaultdict(lambda: defaultdict(list))
         for module_path, meta in sorted(modules.items()):
             if not meta.get("options"):
                 continue
+            cat = self._detect_category(module_path)
+            rel = module_path.replace("modules/", "")
+            parts = rel.split("/")
+            sub_key = "/".join(parts[1:-1]) if len(parts) > 2 else ""
+            tree_data[cat][sub_key].append((module_path, parts[-1], meta))
 
-            display_name = module_path.replace("modules/", "")
-            item = QListWidgetItem(display_name)
-            item.setData(Qt.ItemDataRole.UserRole, module_path)
-            font = QFont("Hack", 10)
-            item.setFont(font)
-            # Color code by type
-            if "/recon/" in module_path:
-                item.setForeground(QColor("#ffffff"))  # Cyan
-            elif "/strike/" in module_path:
-                item.setForeground(QColor("#ffffff"))  # Red
-            elif "/hold/" in module_path:
-                item.setForeground(QColor("#ffffff"))  # Yellow
-            elif "/ops/" in module_path:
-                item.setForeground(QColor("#ffffff"))  # Green
-            elif "/payload" in module_path:
-                item.setForeground(QColor("#ffffff"))  # Pink
+        CAT_ORDER = ["recon", "strike", "hold", "ops", "payloads", "other"]
 
-            self.module_list.addItem(item)
+        for cat in CAT_ORDER:
+            if cat not in tree_data:
+                continue
+            cm   = self._CAT_META[cat]
+            color = cm["color"]
+            emoji = cm["icon"]
+            label = cm["label"]
+            mod_count = sum(len(v) for v in tree_data[cat].values())
+
+            # Root folder per kategori
+            folder_icon = self._make_folder_icon(color)
+            root_item   = QTreeWidgetItem(self.module_tree)
+            root_item.setText(0, f"  {emoji}  {label}  [{mod_count}]")
+            root_item.setIcon(0, folder_icon)
+            root_item.setData(0, Qt.ItemDataRole.UserRole, None)
+            root_item.setData(0, Qt.ItemDataRole.UserRole + 1, cat)
+            root_item.setForeground(0, QColor(color))
+            root_item.setFont(0, QFont("DejaVu Sans Mono", 10, QFont.Weight.Bold))
+            root_item.setExpanded(True)
+
+            for sub_key in sorted(tree_data[cat].keys()):
+                mods = tree_data[cat][sub_key]
+
+                if sub_key:
+                    # Sub-folder
+                    sub_item = QTreeWidgetItem(root_item)
+                    sub_item.setText(0, f"  📂  {sub_key}  [{len(mods)}]")
+                    sub_item.setIcon(0, self._make_folder_icon(color))
+                    sub_item.setData(0, Qt.ItemDataRole.UserRole, None)
+                    sub_item.setData(0, Qt.ItemDataRole.UserRole + 1, cat)
+                    sub_item.setForeground(0, QColor("#ff0022"))  # Contoh: warna orange
+                    sub_item.setFont(0, QFont("DejaVu Sans Mono", 9))
+                    sub_item.setExpanded(False)
+                    parent_item = sub_item
+                else:
+                    parent_item = root_item
+
+                # Leaf nodes (modul)
+                mod_icon  = self._make_module_icon(color)
+                leaf_font = QFont("DejaVu Sans Mono", 9)
+                for module_path, mod_name, meta in sorted(mods, key=lambda x: x[1]):
+                    desc = meta.get("description", "")
+                    rank = meta.get("rank", "Normal")
+                    leaf = QTreeWidgetItem(parent_item)
+                    leaf.setText(0, f"  {mod_name}")
+                    leaf.setIcon(0, mod_icon)
+                    leaf.setData(0, Qt.ItemDataRole.UserRole, module_path)
+                    leaf.setData(0, Qt.ItemDataRole.UserRole + 1, cat)
+                    leaf.setForeground(0, QColor("#d4d4d4"))
+                    leaf.setFont(0, leaf_font)
+                    if desc:
+                        leaf.setToolTip(0, f"[{rank}] {desc}")
 
         self.update_session_info()
 
     def on_category_click(self):
-        """Handle category button click"""
+        """Handle category button click — expand folder yang sesuai."""
         button = self.sender()
         category = button.property('category')
         self.filter_modules_by_category(category)
 
     def filter_modules_by_category(self, category):
-        """Filter modules by category"""
-        for i in range(self.module_list.count()):
-            item = self.module_list.item(i)
-            module_path = item.data(Qt.ItemDataRole.UserRole)
-
+        """Show/hide root folders sesuai kategori dan expand yang dipilih."""
+        root = self.module_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            cat_item = root.child(i)
+            item_cat = cat_item.data(0, Qt.ItemDataRole.UserRole + 1) or ""
             if category == "all":
-                item.setHidden(False)
-            elif category == "payloads":
-                item.setHidden("payload" not in module_path.lower())
+                cat_item.setHidden(False)
+                cat_item.setExpanded(True)
             else:
-                item.setHidden(f"/{category}/" not in module_path)
+                matches = (item_cat == category) or                           (category == "payloads" and item_cat == "payloads")
+                cat_item.setHidden(not matches)
+                if matches:
+                    cat_item.setExpanded(True)
 
     def search_modules(self):
-        """Search modules as user types"""
-        search_text = self.search_input.text().lower()
+        """Cari modul di QTreeWidget secara real-time; expand folder yang ada hasil."""
+        search_text = self.search_input.text().lower().strip()
 
-        for i in range(self.module_list.count()):
-            item = self.module_list.item(i)
-            module_path = item.data(Qt.ItemDataRole.UserRole)
-            meta = self.framework.metadata.get(module_path, {})
-            description = meta.get("description", "").lower()
+        def _traverse(item):
+            module_path = item.data(0, Qt.ItemDataRole.UserRole)
+            if module_path is None:
+                # Folder — cek child-nya
+                any_visible = False
+                for j in range(item.childCount()):
+                    if _traverse(item.child(j)):
+                        any_visible = True
+                item.setHidden(not any_visible)
+                if any_visible and search_text:
+                    item.setExpanded(True)
+                return any_visible
+            else:
+                # Leaf (modul)
+                if not search_text:
+                    item.setHidden(False)
+                    return True
+                meta = self.framework.metadata.get(module_path, {})
+                desc = meta.get("description", "").lower()
+                matches = search_text in module_path.lower() or search_text in desc
+                item.setHidden(not matches)
+                return matches
 
-            matches = (search_text in module_path.lower() or
-                       search_text in description)
-            item.setHidden(not matches)
+        root = self.module_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            _traverse(root.child(i))
+
+        # Kalau search kosong, kembalikan ke tampilan normal
+        if not search_text:
+            for i in range(root.childCount()):
+                root.child(i).setHidden(False)
+                root.child(i).setExpanded(True)
 
     def perform_search(self):
         """Perform search command"""
@@ -3345,58 +3893,60 @@ class LazyFrameworkGUI(QMainWindow):
             self.execute_command("search", [search_text])
 
     def load_selected_module(self, item):
-        """Load selected module TANPA OUTPUT COMMAND KE CONSOLE"""
+        """Double click: Buka module di bottom tab + update Module Info"""
         if not item:
             return
         
-        import contextlib  # Import di sini
-        import io
-        import os
+        module_path = item.data(0, Qt.ItemDataRole.UserRole)
+        if not module_path:
+            item.setExpanded(not item.isExpanded())
+            return
         
-        module_path = item.data(Qt.ItemDataRole.UserRole)
-        module_name = os.path.basename(module_path)
-        self.set_active_module(module_name)
+        # Update Module Info tab (tab pertama)
+        self.load_module_info_to_main_tab(module_path)
         
-        import shutil
-        module_dir = os.path.dirname(module_path)
-        pycache_dir = os.path.join(module_dir, "__pycache__")
-        if os.path.exists(pycache_dir):
-            try:
-                shutil.rmtree(pycache_dir)
-                self.append_output(f"[bold cyan][*] Cache dihapus: {pycache_dir}[/]")
-            except Exception as e:
-                self.append_output(f"[bold red][!] Gagal hapus cache: {e}[/]")
-        
+        # Buka di Module Tab (bottom)
+        self.open_module_in_tab(module_path)
+
+    def load_module_info_to_main_tab(self, module_path: str):
+        """Update Module Info tab di main_tabs"""
         try:
-            # Execute use command tanpa output ke console
+            if module_path not in self.framework.modules:
+                return
+            
+            # Switch ke Module Info tab
+            self.main_tabs.setCurrentIndex(2)  # Index Module Info
+            
+            # Capture info
+            import io, contextlib
             output_buffer = io.StringIO()
             
-            # Gunakan contextlib.redirect_stdout secara langsung
-            with contextlib.redirect_stdout(output_buffer), contextlib.redirect_stderr(output_buffer):
-                self.framework.cmd_use([module_path])
+            old_module = self.framework.loaded_module
+            # Temporary load untuk cmd_info
+            module_file = self.framework.modules[module_path]
+            spec = importlib.util.spec_from_file_location(module_path.replace('/', '_'), module_file)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
             
-            # Update UI state tanpa output ke console
-            if self.framework.loaded_module:
-                self.current_module = self.framework.loaded_module.name
-                self.current_module_label.setText(f"Loaded: {self.current_module}")
-                self.current_module_label.setStyleSheet("color: #50fa7b; font-weight: bold;")
-                self.run_btn.setEnabled(True)
-                self.back_btn.setEnabled(True)
-                
-                # Load module options
-                self.load_module_options()
-                
-                # Show module info di tab Module Info (bukan console)
-                self.show_module_info_in_tab()
-
-                # === AGENT MODE: AI otomatis isi options & siap run ===
-                if hasattr(self, 'ai_tab') and self.ai_tab.api_key_input.text().strip():
-                    self.ai_tab.run_agent_mode(self.framework.loaded_module)
+            from bin.console import ModuleInstance
+            temp_instance = ModuleInstance(module_path, mod)
+            self.framework.loaded_module = temp_instance
+            
+            with contextlib.redirect_stdout(output_buffer), contextlib.redirect_stderr(output_buffer):
+                self.framework.cmd_info([])
+            
+            self.framework.loaded_module = old_module  # restore
+            
+            info_output = output_buffer.getvalue()
+            if info_output.strip():
+                html = self.create_simple_module_info(info_output)
+                self.module_detail_info.setHtml(html)
+            else:
+                self.module_detail_info.setPlainText("No information available.")
                 
         except Exception as e:
-            self.append_output(f"Error loading module: {e}")
-
-    
+            self.module_detail_info.setPlainText(f"Error loading module info:\n{e}")
+            print(f"[ERROR] load_module_info: {e}")
   
    
 
@@ -3409,24 +3959,19 @@ class LazyFrameworkGUI(QMainWindow):
             # Capture info output
             output_buffer = io.StringIO()
             
-            # Gunakan contextlib.redirect_stdout
             with contextlib.redirect_stdout(output_buffer), contextlib.redirect_stderr(output_buffer):
                 self.framework.cmd_info([])
             
-            # Get the output
             info_output = output_buffer.getvalue()
             
-            # Tampilkan di Module Info tab
             if info_output.strip():
-                # Format sederhana dengan HTML pre untuk menjaga formatting
                 html_output = self.create_simple_module_info(info_output)
                 self.module_detail_info.setHtml(html_output)
                 
-            # Switch ke Module Info tab
-            self.tabs.setCurrentIndex(2)
+            # Ganti self.tabs menjadi self.main_tabs
+            self.main_tabs.setCurrentIndex(2)  # Module Info tab index
             
         except Exception as e:
-            # Fallback ke plain text
             self.module_detail_info.setPlainText(f"Error loading module info: {e}")
         
 
@@ -3619,7 +4164,7 @@ class LazyFrameworkGUI(QMainWindow):
                     if command == "info":
                         clean_info = re.sub(r'\x1b\[[0-9;]*[mG]', '', output)
                         self.module_detail_info.setPlainText(clean_info)
-                        self.tabs.setCurrentIndex(2)  # Switch ke Module Info tab
+                        self.main_tabs.setCurrentIndex(2)  # Switch ke Module Info tab
                     else:
                         self.append_output(output)
 
@@ -3653,6 +4198,7 @@ class LazyFrameworkGUI(QMainWindow):
 
             # Show module info di tab Module Info
             self.show_module_info_in_tab()
+            self.update_session_info()
 
             # === AGENT MODE: AI otomatis isi options via command 'use' ===
             if hasattr(self, 'ai_tab') and self.ai_tab.api_key_input.text().strip():
@@ -3677,7 +4223,34 @@ class LazyFrameworkGUI(QMainWindow):
       
         # ==================================================================
 
-
+    def load_module(self, module_path: str):
+        """Load module by path - for GUI compatibility"""
+        import importlib.util
+        
+        if module_path not in self.modules:
+            return None
+        
+        module_file = self.modules[module_path]
+        
+        # Load module
+        spec = importlib.util.spec_from_file_location(
+            module_path.replace('/', '_'), 
+            module_file
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        
+        # Create ModuleInstance
+        from bin.console import ModuleInstance
+        inst = ModuleInstance(module_path, mod)
+        
+        # Set default options
+        if hasattr(mod, "OPTIONS"):
+            for k, meta in mod.OPTIONS.items():
+                if "default" in meta:
+                    inst.options[k] = meta["default"]
+        
+        return inst
     
 
     def load_module_options(self):
@@ -3714,7 +4287,7 @@ class LazyFrameworkGUI(QMainWindow):
             self.option_widgets[name] = line_edit
 
         # Switch to options tab
-        self.tabs.setCurrentIndex(1)
+        self.main_tabs.setCurrentIndex(1)
 
     def clear_options_tab(self):
         """Clear options tab"""
@@ -3781,7 +4354,18 @@ class LazyFrameworkGUI(QMainWindow):
                 'lock': self.session_lock
             }
             self.framework.session['gui_instance'] = self
-
+            lhost = self.framework.session.get('LHOST', '0.0.0.0')
+            lport = self.framework.session.get('LPORT', 4444)
+            with self.listener_lock:
+                listener_key = f"{lhost}:{lport}"
+                if listener_key not in self.active_listeners:
+                     self.active_listeners.append({
+                          'lhost': lhost,
+                          'lport': lport,
+                          'status': 'active',
+                          'started': time.strftime("%H:%M:%S")                                          
+                     })
+                    
         # UI saat module berjalan
         
         self.run_btn.setEnabled(True)          # harus TRUE supaya STOP bisa diklik
@@ -3789,34 +4373,50 @@ class LazyFrameworkGUI(QMainWindow):
         self.run_btn.setProperty("action", "stop")
         
         self.update_session_info()
+        if hasattr(self, 'network_map_widget'):
+            self.network_map_widget.stop_refresh()
         # Jalankan module dalam thread
         self.module_runner = ModuleRunner(self.framework, self.framework.loaded_module)
         self.module_runner.output.connect(self.append_output)
         self.module_runner.finished.connect(self.on_module_finished)
         self.module_runner.start()
+        #QTimer.singleShot(2000, self.sync_sessions_from_reverse_tcp)   # Sync setelah 2 detik
+        #QTimer.singleShot(3000, self.update_session_info)
+        QTimer.singleShot(1500, lambda: self.safe_ui_update(self.sync_sessions_from_reverse_tcp))
+        QTimer.singleShot(2500, lambda: self.safe_ui_update(self.update_session_info))
 
 
     def on_module_finished(self):
+        if hasattr(self, 'network_map_widget'):
+            self.network_map_widget.start_refresh()
+            
         """Handle module completion"""
-        
-        
-        self.update_session_info()
+        if self.module_runner:
+            self.module_runner.quit()
+            self.module_runner.wait(1500)
+            self.module_runner = None
+       
         self.run_btn.setEnabled(True)
         self.run_btn.setText("START")
         self.run_btn.setProperty("action", "run")
 
         self.append_output("[bold green][+] Module execution completed[/]")
+        self.update_session_info()
 
-        # === AGENT MODE: inject output ke AI dan auto-analyze ===
-        if hasattr(self, 'ai_tab') and self.ai_tab.api_key_input.text().strip():
-            # Ambil output terbaru dari console sebagai konteks
+        # === AGENT MODE AI ===
+        if hasattr(self, 'ai_tab') and hasattr(self.ai_tab, 'api_key_input') and self.ai_tab.api_key_input.text().strip():
             console_text = self.console_output.toPlainText()
-            # Kirim 4000 karakter terakhir (output terbaru dari module)
-            recent_output = console_text[-4000:].strip()
+            recent_output = console_text[-3500:].strip()
             if recent_output:
                 self.ai_tab.inject_output(recent_output)
-                # Switch ke AI tab agar user bisa lihat analisis
-                self.tabs.setCurrentIndex(self.tabs.indexOf(self.ai_tab))
+                # Switch ke AI tab dengan aman
+                try:
+                    ai_index = self.main_tabs.indexOf(self.ai_tab)
+                    if ai_index >= 0:
+                        self.main_tabs.setCurrentIndex(ai_index)
+                except:
+                    pass
+                
                 self.ai_tab.send_message(
                     "Module telah selesai dijalankan. Analisis output berikut, "
                     "identifikasi temuan penting, potensi vulnerability, "
@@ -3841,6 +4441,78 @@ class LazyFrameworkGUI(QMainWindow):
         else:
             self.execute_command(command, [])
 
+
+    # ── QFileSystemWatcher: auto-scan modules tanpa restart GUI ──────────────────
+
+    def start_module_watcher(self):
+        """Watch folder modules/ dan auto-refresh jika ada file baru/dihapus/berubah."""
+        try:
+            project_root = Path(__file__).resolve().parent.parent
+            module_root = str(project_root / "modules")
+
+            if not Path(module_root).exists():
+                self.append_output(f"[yellow]Modules directory not found: {module_root}[/]")
+                return
+            dirs_to_watch = [module_root]
+            for d in Path(module_root).rglob("*"):
+                if d.is_dir() and "__pycache__" not in d.parts:
+                    dirs_to_watch.append(str(d.resolve()))
+            dirs_to_watch = list(set(dirs_to_watch))
+            self._module_watcher = QFileSystemWatcher(self)
+            self._module_watcher.addPaths(dirs_to_watch)
+
+            self._module_refresh_timer = QTimer(self)
+            self._module_refresh_timer.setSingleShot(True)
+            self._module_refresh_timer.setInterval(1500)
+            self._module_refresh_timer.timeout.connect(self._do_auto_refresh_modules)
+        
+            self._module_watcher.directoryChanged.connect(self._on_module_dir_changed)
+            self._module_watcher.fileChanged.connect(self._on_module_file_changed)
+        
+            self.append_output(f"[cyan]👁️ Module watcher aktif: {len(dirs_to_watch)} folder dipantau[/]")
+            self.append_output(f"[dim]Monitoring: {module_root}[/]")
+  
+        except Exception as e:
+            self.append_output(f"[red]Module watcher error: {e}[/]")
+
+    def _on_module_dir_changed(self, path):
+        """Dipanggil saat ada file baru/dihapus di folder modules."""
+        try:
+            for d in Path(path).iterdir():
+                if d.is_dir() and "__pycache__" not in d.parts:
+                    dp = str(d.resolve())
+                    if dp not in self._module_watcher.directories():
+                        self._module_watcher.addPath(dp)
+        except Exception:
+            pass
+        if not self._module_refresh_timer.isActive():
+            self._module_refresh_timer.start()
+
+    def _on_module_file_changed(self, path):
+        """Dipanggil saat file .py di modules berubah."""
+        if not self._module_refresh_timer.isActive():
+            self._module_refresh_timer.start()
+
+    def _do_auto_refresh_modules(self):
+        """Jalankan refresh modul otomatis (dipanggil setelah debounce 1.5 detik)."""
+        try:
+            self.framework.scan_modules()
+            self.load_all_modules()
+            total = len(self.framework.modules)
+            if hasattr(self, 'show_cyber_toast'):
+                self.show_cyber_toast(
+                    f"🔄 {total} modules terscan otomatis",
+                    title="Module Auto-Refresh",
+                    duration_ms=3000,
+                    level="info"
+                )
+            self.append_output(f"[green]✓ Auto-refresh: {total} modules ditemukan[/]")
+            self.update_session_info()
+        except Exception as e:
+            self.append_output(f"[red]Auto-refresh error: {e}[/]")
+            import traceback
+            self.append_output(f"[red]{traceback.format_exc()}[/]")
+
     def refresh_modules(self):
         """Refresh modules list"""
         self.framework.scan_modules()
@@ -3859,9 +4531,14 @@ class LazyFrameworkGUI(QMainWindow):
             self.console_output.setFont(font)
             self.module_detail_info.setFont(font)
             self.session_info.setFont(font)
-            for i in range(self.module_list.count()):
-                item = self.module_list.item(i)
-                item.setFont(font)
+            if hasattr(self, 'module_tree'):
+                def _set_cf(node):
+                    node.setFont(0, font)
+                    for j in range(node.childCount()):
+                        _set_cf(node.child(j))
+                cf_root = self.module_tree.invisibleRootItem()
+                for i in range(cf_root.childCount()):
+                    _set_cf(cf_root.child(i))
 
             # Terapkan ke input field juga jika mau
             for widget in getattr(self, 'option_widgets', {}).values():
@@ -3918,17 +4595,25 @@ class LazyFrameworkGUI(QMainWindow):
             'macos': 0,
             'unknown': 0
         }
+
+        hostnames_list = []  # TAMBAHKAN INI
         
         # Hitung OS dari GUI sessions
         for sess_id, sess in self.sessions.items():
             os_type = sess.get('os', 'unknown')
             status = sess.get('status', 'alive')
+            hostname = sess.get('hostname', '')
             
             if status == 'alive':
                 if os_type in target_os_stats:
                     target_os_stats[os_type] += 1
                 else:
                     target_os_stats['unknown'] += 1
+                
+                # Kumpulkan hostname yang valid
+                if hostname and hostname != 'unknown' and hostname not in hostnames_list:
+                    hostnames_list.append(hostname)
+
 
         # Format OS statistics
         os_icons = {'linux': '🐧', 'windows': '🪟', 'macos': '🍎', 'unknown': '💻'}
@@ -3940,7 +4625,10 @@ class LazyFrameworkGUI(QMainWindow):
                 os_display.append(f"{icon}×{count}")
 
         os_summary = " | ".join(os_display) if os_display else "No active targets"
-
+        # Format hostnames
+        hostnames_summary = ", ".join(hostnames_list[:3]) if hostnames_list else "None"
+        if len(hostnames_list) > 3:
+            hostnames_summary += f" +{len(hostnames_list)-3} more"
         uptime_sec = int(time.time() - self.framework.session.get("start_time", time.time()))
         d = uptime_sec // 86400
         h = (uptime_sec % 86400) // 3600
@@ -3960,6 +4648,18 @@ class LazyFrameworkGUI(QMainWindow):
         if "reverse_tcp" in current_module.lower() and active_listeners_count > 0:
             current_module = f"🚀 {current_module}"
 
+        usernames_list = []
+        for sess_id, sess in self.sessions.items():
+            status = sess.get('status', 'alive')
+            username = sess.get('username', '')
+            if status == 'alive' and username and username != 'unknown':
+                if username not in usernames_list:
+                    usernames_list.append(username)
+        
+        usernames_summary = ", ".join(usernames_list[:3]) if usernames_list else "None"
+        if len(usernames_list) > 3:
+            usernames_summary += f" +{len(usernames_list)-3} more"
+
         # === HTML TANPA LISTENER DETAILS & TARGET OS BREAKDOWN ===
         html = f"""
         <div style="line-height:1.5;">
@@ -3974,6 +4674,7 @@ class LazyFrameworkGUI(QMainWindow):
             <b style="color:#ff5252;">LISTENERS</b>    : <span style="color:#8be9fd;">{active_listeners_count} ACTIVE</span><br>
             <b style="color:#ff5252;">SESSIONS</b>     : <span style="color:#bd93f9;">{total_sess} TOTAL</span> | <span style="color:#50fa7b;">{online_sess} ALIVE</span><br>
             <b style="color:#ff5252;">TARGET OS</b>    : <span style="color:#ffffff;">{os_summary}</span><br>
+            <b style="color:#ff5252;">HOSTNAMES</b>    : <span style="color:#50fa7b;">{hostnames_summary}</span><br>
             <b style="color:#ff5252;">MODULES</b>      : <span style="color:#ffffff;">{len(self.framework.modules)}</span><br>
             <b style="color:#ff5252;">CURRENT</b>      : <span style="color:#ff5552;">{current_module}</span><br>
             <b style="color:#ff5252;">PROXY</b>        : <span style="color:{proxy_color};">{proxy_status}</span> {proxy_detail}<br>
@@ -4005,10 +4706,6 @@ class LazyFrameworkGUI(QMainWindow):
         self.update_session_info()  # ← Gunakan method yang benar
 
 
-    def update_info_panel(self):
-        """Update header info panel (atas GUI)"""
-        # HAPUS METHOD INI SELURUHNYA
-        pass
 
 
     
@@ -4034,8 +4731,15 @@ class LazyFrameworkGUI(QMainWindow):
 
     def closeEvent(self, event):
         """Cleanup saat aplikasi ditutup"""
-        if hasattr(self, 'browser') and self.browser:
-            self.browser.deleteLater()
+        try:
+            if self.module_runner and self.module_runner.isRunning():
+                self.module_runner.stop()
+                self.module_runner.wait(1000)
+            if hasattr(self, 'browser') and self.browser:
+                self.browser.deleteLater()
+        except:
+              pass
+
         event.accept()
 
     def open_in_browser(self, url):
