@@ -151,3 +151,52 @@ func (s *Server) Start() error {
     listener.Close()
     return nil
 }
+
+// Monitor ngrok tunnel changes every 30 seconds
+func (s *Server) monitorNgrokTunnel() {
+    ticker := time.NewTicker(30 * time.Second)
+    defer ticker.Stop()
+
+    for range ticker.C {
+        if !s.running {
+            break
+        }
+
+        host, port := getNgrokTunnel()
+        
+        if host != "" && port > 0 {
+            if s.config.NgrokHost != host || s.config.NgrokPort != port {
+                log.Printf("🔄 Ngrok tunnel changed: %s:%d (was: %s:%d)", 
+                    host, port, s.config.NgrokHost, s.config.NgrokPort)
+                s.config.NgrokHost = host
+                s.config.NgrokPort = port
+                SaveConfig(s.config)
+                s.BroadcastTunnelUpdate(host, port)
+            }
+        }
+    }
+}
+
+// Broadcast tunnel update to all connected agents
+func (s *Server) BroadcastTunnelUpdate(host string, port int) {
+    s.mutex.RLock()
+    defer s.mutex.RUnlock()
+
+    for _, agent := range s.agents {
+        updateMsg := map[string]interface{}{
+            "type": "tunnel_update",
+            "data": map[string]interface{}{
+                "host": host,
+                "port": port,
+            },
+        }
+        
+        if agent.Writer != nil {
+            msgBytes, _ := json.Marshal(updateMsg)
+            msgBytes = append(msgBytes, '\n')
+            agent.Writer.Write(msgBytes)
+            agent.Writer.Flush()
+            log.Printf("📤 Tunnel update sent to agent: %s", agent.ID)
+        }
+    }
+}
