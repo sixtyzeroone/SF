@@ -1,0 +1,122 @@
+func fetchNgrokAPI() (string, int) {
+    // ✅ TRY MULTIPLE ENDPOINTS WITH PROPER ERROR HANDLING
+    endpoints := []string{
+        "http://localhost:4040/api/tunnels",      // Default ngrok API
+        "http://127.0.0.1:4040/api/tunnels",      // Localhost alternative
+        "http://localhost:5000/api/tunnels",      // Alternative port
+    }
+
+    client := &http.Client{
+        Timeout: 3 * time.Second,
+    }
+
+    for _, endpoint := range endpoints {
+        log.Printf("🔍 Trying ngrok API endpoint: %s", endpoint)
+        
+        resp, err := client.Get(endpoint)
+        if err != nil {
+            log.Printf("  ❌ Failed: %v", err)
+            continue
+        }
+        defer resp.Body.Close()
+
+        if resp.StatusCode != http.StatusOK {
+            log.Printf("  ❌ Status: %d", resp.StatusCode)
+            continue
+        }
+
+        var result struct {
+            Tunnels []struct {
+                PublicURL string `json:"public_url"`
+                Proto     string `json:"proto"`
+            } `json:"tunnels"`
+        }
+
+        if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+            log.Printf("  ❌ Decode error: %v", err)
+            continue
+        }
+
+        // Find TCP tunnel
+        for _, t := range result.Tunnels {
+            if t.Proto == "tcp" && t.PublicURL != "" {
+                parts := strings.Split(strings.TrimPrefix(t.PublicURL, "tcp://"), ":")
+                if len(parts) == 2 {
+                    if port, err := strconv.Atoi(parts[1]); err == nil {
+                        log.Printf("  ✅ Found tunnel: %s:%d", parts[0], port)
+                        return parts[0], port
+                    }
+                }
+            }
+        }
+    }
+
+    log.Printf("⚠️ No ngrok API response from any endpoint")
+    return "", 0
+}
+
+func getNgrokFromConfigFile() (string, int) {
+    data, err := os.ReadFile("config.json")
+    if err != nil {
+        log.Printf("  ⚠️ config.json not found: %v", err)
+        return "", 0
+    }
+
+    var cfg Config  // ✅ Use actual Config struct
+    if err := json.Unmarshal(data, &cfg); err != nil {
+        log.Printf("  ⚠️ config.json parse error: %v", err)
+        return "", 0
+    }
+
+    if cfg.NgrokHost != "" && cfg.NgrokPort > 0 {
+        log.Printf("  📁 Using config: %s:%d", cfg.NgrokHost, cfg.NgrokPort)
+        return cfg.NgrokHost, cfg.NgrokPort
+    }
+
+    log.Printf("  ⚠️ ngrok_host or ngrok_port empty in config.json")
+    return "", 0
+}
+
+func detectRunningNgrokProcess() (string, int) {
+    // ✅ TRY TO CONNECT TO COMMON NGROK PORTS
+    commonPorts := []int{4040, 5000, 14321, 25375, 12345, 1337, 4444}
+
+    for _, p := range commonPorts {
+        addr := fmt.Sprintf("localhost:%d", p)
+        
+        conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+        if err == nil {
+            conn.Close()
+            
+            if p == 4040 {
+                if host, port := fetchNgrokAPI(); host != "" && port > 0 {
+                    return host, port
+                }
+            }
+            
+            log.Printf("  🔗 Found open port: %d", p)
+        }
+    }
+
+    return "", 0
+}
+
+// Verify ngrok connection at startup
+func VerifyNgrokConnection(config *Config) {
+    log.Printf("\n📡 Verifying Ngrok Connection...")
+    
+    host, port := getNgrokTunnel()
+    
+    if host != "" && port > 0 {
+        log.Printf("✅ Ngrok tunnel verified: %s:%d", host, port)
+        config.NgrokHost = host
+        config.NgrokPort = port
+        SaveConfig(config)
+        log.Printf("✅ Config updated: ngrok_host=%s, ngrok_port=%d", host, port)
+    } else {
+        log.Printf("⚠️ WARNING: No active Ngrok tunnel!")
+        log.Printf("   - Run: ngrok tcp 4444")
+        log.Printf("   - Or configure config.json with ngrok_host & ngrok_port")
+        log.Printf("   - Agents will use: %s", config.GetAddress())
+    }
+}
