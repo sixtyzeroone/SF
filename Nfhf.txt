@@ -120,3 +120,4 @@ func VerifyNgrokConnection(config *Config) {
         log.Printf("   - Agents will use: %s", config.GetAddress())
     }
 }
+func (s *Server) Start() error {
